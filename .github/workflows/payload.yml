@@ -1,0 +1,49 @@
+name: Build v15 offline payload in the cloud
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  payload:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify and unpack reviewed source archive
+        run: |
+          echo '0420aefac5d40af47910eaefb35a0eb2fc7e98fa1dab4652dea79499f23c848b  v15-source-bundle.tar.gz' | sha256sum -c -
+          tar -xzf v15-source-bundle.tar.gz
+      - name: Fetch and verify pinned public vendor content
+        run: python3 build/fetch-payload.py
+      - name: Assemble the offline payload container
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${OWNER,,}/elastic-watchtower-v15:${GITHUB_SHA}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          docker build --platform linux/amd64 --build-arg EPR_BASE="$(cat epr-base.txt)" --label "org.opencontainers.image.source=https://github.com/$REPO" -f build/Containerfile -t "$image" .
+          docker run -d --name v15-epr-test --network none "$image"
+          docker inspect v15-epr-test --format '{{.State.Running}}' | grep -qx true
+          docker rm -f v15-epr-test
+          docker run -d --name v15-epr-api -p 127.0.0.1:18080:8080 "$image"
+          trap 'docker rm -f v15-epr-api; docker logout ghcr.io' EXIT
+          for n in $(seq 1 60); do curl -fsS http://127.0.0.1:18080/health >/dev/null && break; sleep 2; done
+          curl -fsS 'http://127.0.0.1:18080/search?kibana.version=9.5.4' > epr-search.json
+          python3 build/check-epr.py epr-search.json
+          docker push "$image"
+          docker inspect "$image" --format '{{index .RepoDigests 0}}' > payload-image.txt
+          cat payload-image.txt >> "$GITHUB_STEP_SUMMARY"
+          echo 'Container publication does not constitute a Red Hat image build or a guest acceptance test.' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v15-payload-reference
+          path: |
+            payload-image.txt
+            epr-search.json
+          if-no-files-found: error
